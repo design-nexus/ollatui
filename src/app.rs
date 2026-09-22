@@ -142,6 +142,7 @@ pub enum Setting {
     Theme,
     Host,
     DefaultModel,
+    AssistantName,
     Temperature,
     TopP,
     NumCtx,
@@ -153,12 +154,13 @@ pub enum Setting {
 }
 
 impl Setting {
-    pub const ALL: [Setting; 13] = [
+    pub const ALL: [Setting; 14] = [
         Setting::Autostart,
         Setting::StopOnQuit,
         Setting::Theme,
         Setting::Host,
         Setting::DefaultModel,
+        Setting::AssistantName,
         Setting::Temperature,
         Setting::TopP,
         Setting::NumCtx,
@@ -176,6 +178,7 @@ impl Setting {
             Setting::Theme => "Theme",
             Setting::Host => "Host",
             Setting::DefaultModel => "Default model",
+            Setting::AssistantName => "Assistant name",
             Setting::Temperature => "Temperature",
             Setting::TopP => "Top P",
             Setting::NumCtx => "Context",
@@ -194,6 +197,7 @@ impl Setting {
             Setting::Theme => "Enter opens the palette list",
             Setting::Host => "Ollama server URL",
             Setting::DefaultModel => "Model used for a new chat",
+            Setting::AssistantName => "Name shown above replies",
             Setting::Temperature => "Left and right nudge by 0.1",
             Setting::TopP => "Left and right nudge by 0.05",
             Setting::NumCtx => "Left and right nudge by 1024",
@@ -238,7 +242,9 @@ pub struct App {
     pub chats: Vec<Conversation>,
     pub chat_index: usize,
     pub chat_pane: ChatPane,
+    pub show_chats: bool,
     pub composer: Field,
+    pub slash_pick: usize,
     pub stick_bottom: bool,
     pub scroll: usize,
     pub transcript_len: usize,
@@ -320,7 +326,9 @@ impl App {
             chats,
             chat_index: 0,
             chat_pane: ChatPane::Composer,
+            show_chats: true,
             composer: Field::default(),
+            slash_pick: 0,
             stick_bottom: true,
             scroll: 0,
             transcript_len: 0,
@@ -678,6 +686,7 @@ impl App {
                     self.config.default_model.clone()
                 }
             }
+            Setting::AssistantName => self.config.assistant_name.clone(),
             Setting::Temperature => format!("{:.2}", self.config.temperature),
             Setting::TopP => format!("{:.2}", self.config.top_p),
             Setting::NumCtx => self.config.num_ctx.to_string(),
@@ -802,6 +811,10 @@ impl App {
             self.open_system();
             return;
         }
+        if ctrl(&key, 'b') {
+            self.toggle_chats();
+            return;
+        }
         match key.code {
             KeyCode::PageUp => self.page(-1),
             KeyCode::PageDown => self.page(1),
@@ -837,7 +850,13 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.transcript_cursor = self.transcript_cursor.saturating_sub(1);
             }
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => self.chat_pane = ChatPane::Sidebar,
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
+                self.chat_pane = if self.show_chats {
+                    ChatPane::Sidebar
+                } else {
+                    ChatPane::Composer
+                };
+            }
             KeyCode::Enter => self.toggle_thinking_or_compose(),
             KeyCode::Char('i') | KeyCode::Char('l') | KeyCode::Right => {
                 self.chat_pane = ChatPane::Composer
@@ -847,6 +866,60 @@ impl App {
     }
 
     fn key_composer(&mut self, key: KeyEvent) {
+        if self.model_palette_open() {
+            let count = self.model_matches().len();
+            match key.code {
+                KeyCode::Up => {
+                    self.slash_pick = self.slash_pick.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    if count > 0 {
+                        self.slash_pick = (self.slash_pick + 1).min(count - 1);
+                    }
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter if count > 0 => {
+                    self.accept_model_palette();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.composer.clear();
+                    self.slash_pick = 0;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if self.slash_palette_open() {
+            let count = self.slash_matches().len();
+            match key.code {
+                KeyCode::Up => {
+                    self.slash_pick = self.slash_pick.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    if count > 0 {
+                        self.slash_pick = (self.slash_pick + 1).min(count - 1);
+                    }
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.complete_slash();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.composer.clear();
+                    self.slash_pick = 0;
+                    return;
+                }
+                KeyCode::Enter if !self.slash_query_exact() => {
+                    self.complete_slash();
+                    return;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Up if composer_at_edge(&self.composer, true) => {
                 self.scroll_lines(-1);
@@ -870,12 +943,115 @@ impl App {
             }
             return;
         }
+        let before = self.composer.value.clone();
         match input(&mut self.composer, &key, true) {
             Input::Submit => self.send(),
             Input::Newline => self.composer.insert('\n'),
             Input::Cancel => self.chat_pane = ChatPane::Transcript,
             Input::Handled | Input::Ignored => {}
         }
+        if self.composer.value != before {
+            self.slash_pick = 0;
+        }
+    }
+
+    pub fn slash_palette_open(&self) -> bool {
+        self.slash_query().is_some()
+    }
+
+    pub fn model_palette_open(&self) -> bool {
+        self.model_argument().is_some()
+    }
+
+    pub fn model_argument(&self) -> Option<&str> {
+        if self.chat_pane != ChatPane::Composer
+            || self.model_picker
+            || self.renaming
+            || self.editing_system
+        {
+            return None;
+        }
+        crate::slash::model_argument(&self.composer.value)
+    }
+
+    pub fn model_matches(&self) -> Vec<String> {
+        let Some(query) = self.model_argument() else {
+            return Vec::new();
+        };
+        if query.is_empty() {
+            return self.models.iter().map(|model| model.name.clone()).collect();
+        }
+        let mut scored: Vec<(i32, String)> = self
+            .models
+            .iter()
+            .filter_map(|model| {
+                crate::slash::name_score(query, &model.name)
+                    .map(|score| (score, model.name.clone()))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().map(|(_, name)| name).collect()
+    }
+
+    fn accept_model_palette(&mut self) {
+        let matches = self.model_matches();
+        let Some(name) = matches
+            .get(self.slash_pick)
+            .cloned()
+            .or_else(|| matches.first().cloned())
+        else {
+            return;
+        };
+        self.composer.clear();
+        self.slash_pick = 0;
+        self.set_model(name);
+    }
+
+    fn toggle_chats(&mut self) {
+        self.show_chats = !self.show_chats;
+        if !self.show_chats && self.chat_pane == ChatPane::Sidebar {
+            self.chat_pane = ChatPane::Composer;
+        }
+    }
+
+    /// Text after `/` while the command name is still being typed.
+    pub fn slash_query(&self) -> Option<&str> {
+        if self.chat_pane != ChatPane::Composer
+            || self.model_picker
+            || self.renaming
+            || self.editing_system
+        {
+            return None;
+        }
+        let value = self.composer.value.as_str();
+        if value.contains(['\n', ' ', '\t']) {
+            return None;
+        }
+        let rest = value.strip_prefix('/')?;
+        if rest.chars().any(|ch| !ch.is_ascii_alphanumeric()) {
+            return None;
+        }
+        Some(rest)
+    }
+
+    pub fn slash_matches(&self) -> Vec<&'static crate::slash::Command> {
+        let Some(query) = self.slash_query() else {
+            return Vec::new();
+        };
+        crate::slash::matching(query)
+    }
+
+    fn slash_query_exact(&self) -> bool {
+        self.slash_query().is_some_and(crate::slash::is_exact)
+    }
+
+    fn complete_slash(&mut self) {
+        let matches = self.slash_matches();
+        let Some(command) = matches.get(self.slash_pick).or_else(|| matches.first()) else {
+            return;
+        };
+        self.composer = crate::field::Field::new(crate::slash::completion(command));
+        self.slash_pick = 0;
     }
 
     fn key_model_picker(&mut self, key: KeyEvent) {
@@ -1106,6 +1282,7 @@ impl App {
             },
             Setting::Host
             | Setting::DefaultModel
+            | Setting::AssistantName
             | Setting::Temperature
             | Setting::TopP
             | Setting::NumCtx
@@ -1118,6 +1295,7 @@ impl App {
         let text = match Setting::ALL[self.settings_index] {
             Setting::Host => self.config.host.clone(),
             Setting::DefaultModel => self.config.default_model.clone(),
+            Setting::AssistantName => self.config.assistant_name.clone(),
             Setting::Temperature => format!("{:.2}", self.config.temperature),
             Setting::TopP => format!("{:.2}", self.config.top_p),
             Setting::NumCtx => self.config.num_ctx.to_string(),
@@ -1143,6 +1321,15 @@ impl App {
             }
             Setting::DefaultModel => {
                 self.config.default_model = raw;
+                self.editing = false;
+                self.save_config();
+            }
+            Setting::AssistantName => {
+                self.config.assistant_name = if raw.is_empty() {
+                    "assistant".into()
+                } else {
+                    raw
+                };
                 self.editing = false;
                 self.save_config();
             }
@@ -1809,6 +1996,7 @@ impl App {
             "stop" => self.service_action = Some("stop"),
             "restart" => self.service_action = Some("restart"),
             "model" => self.slash_model(arg),
+            "chats" => self.toggle_chats(),
             "new" => self.new_chat(),
             "clear" => self.clear_chat(),
             "cancel" => self.stop_generation(),

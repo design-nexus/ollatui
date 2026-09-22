@@ -1,5 +1,5 @@
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -17,14 +17,28 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let theme = app.theme.clone();
+    let text_rows = composer_rows(&app.composer.value, area.width.saturating_sub(2) as usize);
+    let composer_h = (text_rows as u16 + 2)
+        .min(area.height.saturating_sub(1))
+        .max(3);
     let [top, composer_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(5)]).areas(area);
-    let side_w = if top.width > 64 { 26 } else { 16 };
-    let [side, transcript] =
-        Layout::horizontal([Constraint::Length(side_w), Constraint::Min(1)]).areas(top);
-    draw_sidebar(frame, app, &theme, side);
+        Layout::vertical([Constraint::Min(1), Constraint::Length(composer_h)]).areas(area);
+    let transcript = if app.show_chats {
+        let side_w = if top.width > 64 { 26 } else { 16 };
+        let [side, transcript] =
+            Layout::horizontal([Constraint::Length(side_w), Constraint::Min(1)]).areas(top);
+        draw_sidebar(frame, app, &theme, side);
+        transcript
+    } else {
+        top
+    };
     draw_transcript(frame, app, &theme, transcript);
     draw_composer(frame, app, &theme, composer_area);
+    if app.model_palette_open() {
+        draw_model_palette(frame, app, &theme, transcript);
+    } else if app.slash_palette_open() {
+        draw_slash_palette(frame, app, &theme, transcript);
+    }
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
@@ -136,6 +150,7 @@ fn transcript_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>
             width,
             selected,
             app.config.show_token_stats,
+            app.config.assistant_name.as_str(),
         ));
         lines.push(Line::from(""));
     }
@@ -148,17 +163,20 @@ fn message_lines(
     width: usize,
     selected: bool,
     show_stats: bool,
+    assistant_name: &str,
 ) -> Vec<Line<'static>> {
+    if message.role == "user" {
+        return user_message_lines(message, theme, width, selected);
+    }
     let mut lines = Vec::new();
-    let (role, color) = if message.role == "user" {
-        ("you", theme.accent)
-    } else {
-        ("assistant", theme.green)
-    };
+    let name = assistant_name.trim();
+    let name = if name.is_empty() { "assistant" } else { name };
     let marker = if selected { "▌ " } else { "  " };
     lines.push(Line::from(Span::styled(
-        format!("{marker}{role}"),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
+        format!("{marker}{name}"),
+        Style::default()
+            .fg(theme.green)
+            .add_modifier(Modifier::BOLD),
     )));
 
     let (tagged, body) = split_think(&message.content);
@@ -246,6 +264,221 @@ fn message_lines(
         }
     }
     lines
+}
+
+fn user_message_lines(
+    message: &Message,
+    theme: &Theme,
+    width: usize,
+    _selected: bool,
+) -> Vec<Line<'static>> {
+    let bg = lift(theme.bg);
+    let text_style = Style::default().fg(theme.fg).bg(bg);
+    let prompt_style = Style::default()
+        .fg(theme.green)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+    let prompt = "❯ ";
+    let prompt_cols = crate::util::width_of(prompt).max(1);
+    let text_cols = width.saturating_sub(prompt_cols).max(1);
+    let mut lines = Vec::new();
+    let body = message.content.trim();
+    if body.is_empty() || width == 0 {
+        lines.push(user_line(prompt, prompt_style, "", text_style, text_cols));
+        return lines;
+    }
+    let mut first = true;
+    for para in body.split('\n') {
+        if para.is_empty() {
+            lines.push(user_line(
+                &" ".repeat(prompt_cols),
+                text_style,
+                "",
+                text_style,
+                text_cols,
+            ));
+            continue;
+        }
+        for wrapped in wrap(para, text_cols) {
+            if first {
+                lines.push(user_line(
+                    prompt,
+                    prompt_style,
+                    &wrapped,
+                    text_style,
+                    text_cols,
+                ));
+                first = false;
+            } else {
+                lines.push(user_line(
+                    &" ".repeat(prompt_cols),
+                    text_style,
+                    &wrapped,
+                    text_style,
+                    text_cols,
+                ));
+            }
+        }
+    }
+    lines
+}
+
+fn user_line(
+    prefix: &str,
+    prefix_style: Style,
+    text: &str,
+    text_style: Style,
+    text_cols: usize,
+) -> Line<'static> {
+    let shown = if crate::util::width_of(text) > text_cols {
+        truncate(text, text_cols)
+    } else {
+        text.to_string()
+    };
+    let pad = text_cols.saturating_sub(crate::util::width_of(&shown));
+    Line::from(vec![
+        Span::styled(prefix.to_string(), prefix_style),
+        Span::styled(shown, text_style),
+        Span::styled(" ".repeat(pad), text_style),
+    ])
+}
+
+fn lift(color: Color) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(bump(r), bump(g), bump(b)),
+        other => other,
+    }
+}
+
+fn bump(channel: u8) -> u8 {
+    channel.saturating_add(18)
+}
+
+fn composer_rows(value: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 0usize;
+    let parts: Vec<&str> = value.split('\n').collect();
+    for (index, part) in parts.iter().enumerate() {
+        let cols = crate::util::width_of(part);
+        let cursor = usize::from(index + 1 == parts.len());
+        rows += (cols + cursor).div_ceil(width).max(1);
+    }
+    rows.clamp(1, 8)
+}
+
+fn draw_model_palette(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let matches = app.model_matches();
+    let shown = 8usize;
+    let pick = if matches.is_empty() {
+        0
+    } else {
+        app.slash_pick.min(matches.len() - 1)
+    };
+    let start = pick
+        .saturating_add(1)
+        .saturating_sub(shown)
+        .min(matches.len().saturating_sub(shown));
+    let window: Vec<_> = matches.iter().skip(start).take(shown).collect();
+    let rows = window.len().max(1) as u16;
+    let height = rows.saturating_add(2).min(area.height);
+    let width = 52.min(area.width);
+    let rect = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(height),
+        width,
+        height,
+    );
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    let block = panel("Models", true, theme);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+    let mut lines = Vec::new();
+    if window.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No installed models",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    for (offset, name) in window.iter().enumerate() {
+        let selected = start + offset == pick;
+        let style = if selected {
+            theme.selected()
+        } else {
+            Style::default().fg(theme.fg).bg(theme.bg)
+        };
+        lines.push(Line::from(Span::styled(
+            truncate(name, inner.width as usize),
+            style,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_slash_palette(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let matches = app.slash_matches();
+    let shown = 8usize;
+    let pick = if matches.is_empty() {
+        0
+    } else {
+        app.slash_pick.min(matches.len() - 1)
+    };
+    let start = pick
+        .saturating_add(1)
+        .saturating_sub(shown)
+        .min(matches.len().saturating_sub(shown));
+    let window: Vec<_> = if matches.is_empty() {
+        Vec::new()
+    } else {
+        matches.iter().skip(start).take(shown).collect()
+    };
+    let rows = window.len().max(1) as u16;
+    let height = rows.saturating_add(2).min(area.height);
+    let width = 52.min(area.width);
+    let rect = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(height),
+        width,
+        height,
+    );
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    let block = panel("Commands", true, theme);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+    let mut lines = Vec::new();
+    if window.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No matching commands",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    for (offset, command) in window.iter().enumerate() {
+        let selected = start + offset == pick;
+        let style = if selected {
+            theme.selected()
+        } else {
+            Style::default().fg(theme.fg).bg(theme.bg)
+        };
+        let name = format!("/{:<8}", command.name);
+        let summary = truncate(command.summary, inner.width.saturating_sub(12) as usize);
+        lines.push(Line::from(vec![
+            Span::styled(
+                name,
+                if selected {
+                    style
+                } else {
+                    Style::default().fg(theme.accent).bg(theme.bg)
+                },
+            ),
+            Span::styled(summary, style),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_composer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {

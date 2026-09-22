@@ -3,6 +3,7 @@ mod config;
 mod field;
 mod hf;
 mod ollama;
+mod slash;
 mod store;
 mod theme;
 mod ui;

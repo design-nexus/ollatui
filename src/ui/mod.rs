@@ -196,12 +196,15 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         "  /model [name]               pick the chat model",
         "  /new  /clear  /cancel       new chat, wipe it, stop a reply",
         "  /system [prompt]  /theme [name]  /pull <name>",
-        "  /help  /quit",
+        "  /model then a space filters installed models",
+        "  ^B or /chats shows or hides the chat list",
+        "  type / to filter commands, tab completes, enter runs",
+        "  /help  /quit  /q",
         "",
         "Settings can start Ollama with the app, and stop it on quit.",
         "tab / shift+tab switch screens    ? help    q or ^C quit",
     ];
-    overlay(frame, theme, area, " Help ", &lines, 68, 18);
+    overlay(frame, theme, area, " Help ", &lines, 68, 22);
 }
 
 fn draw_confirm(frame: &mut Frame, theme: &Theme, area: Rect, confirm: &crate::app::Confirm) {

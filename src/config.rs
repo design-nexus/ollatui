@@ -12,6 +12,8 @@ pub struct Config {
     pub host: String,
     #[serde(default)]
     pub default_model: String,
+    #[serde(default = "default_assistant_name")]
+    pub assistant_name: String,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
     #[serde(default = "default_top_p")]
@@ -50,6 +52,9 @@ fn default_num_ctx() -> u32 {
 fn default_keep_alive() -> String {
     "5m".into()
 }
+fn default_assistant_name() -> String {
+    "assistant".into()
+}
 fn default_true() -> bool {
     true
 }
@@ -60,6 +65,7 @@ impl Default for Config {
             theme: default_theme(),
             host: default_host(),
             default_model: String::new(),
+            assistant_name: default_assistant_name(),
             temperature: default_temperature(),
             top_p: default_top_p(),
             num_ctx: default_num_ctx(),
@@ -108,6 +114,10 @@ impl Config {
         }
         if self.keep_alive.trim().is_empty() {
             self.keep_alive = default_keep_alive();
+        }
+        self.assistant_name = self.assistant_name.trim().to_string();
+        if self.assistant_name.is_empty() {
+            self.assistant_name = default_assistant_name();
         }
     }
 }
