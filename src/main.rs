@@ -13,7 +13,7 @@ use std::io::stdout;
 
 use anyhow::Context;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -65,15 +65,6 @@ async fn main() -> anyhow::Result<()> {
     let (tx, mut rx) = unbounded_channel();
     let mut app = App::new(cfg, config_path, chats, omarchy, omarchy_name, watch, tx);
     app.bootstrap();
-    if app.config.autostart_ollama {
-        let state = ollama::service_state();
-        if !matches!(state.as_str(), "active" | "running" | "activating") {
-            println!("Starting Ollama…");
-            if let Err(err) = ollama::control("start") {
-                eprintln!("{err}");
-            }
-        }
-    }
 
     enable_raw_mode().context("failed to put the terminal in raw mode")?;
     execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)
@@ -86,6 +77,17 @@ async fn main() -> anyhow::Result<()> {
         if let Err(err) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
             break Err(err).context("drawing the screen");
         }
+        if let Some(action) = app.take_service_action() {
+            let suspended = Suspended::enter();
+            println!();
+            let result = ollama::control(action);
+            drop(suspended);
+            if let Err(err) = terminal.clear() {
+                break Err(err).context("clearing the screen");
+            }
+            app.finish_service(result);
+            continue;
+        }
         tokio::select! {
             biased;
             event = reader.next() => {
@@ -94,27 +96,20 @@ async fn main() -> anyhow::Result<()> {
                         if app.on_key(key) {
                             break Ok(());
                         }
-                        if let Some(action) = app.take_service_action() {
-                            let suspended = Suspended::enter();
-                            println!();
-                            let result = ollama::control(action);
-                            drop(suspended);
-                            if let Err(err) = terminal.clear() {
-                                break Err(err).context("clearing the screen");
-                            }
-                            app.finish_service(result);
-                        }
                     }
                     Some(Ok(Event::Paste(text))) => app.on_paste(&text),
-                    Some(Ok(Event::Mouse(mouse))) => {
-                        if app.screen == crate::app::Screen::Chat {
-                            match mouse.kind {
-                                MouseEventKind::ScrollUp => app.scroll_lines(-3),
-                                MouseEventKind::ScrollDown => app.scroll_lines(3),
-                                _ => {}
-                            }
+                    Some(Ok(Event::Mouse(mouse))) => match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) if app.start_clicked(mouse.column, mouse.row) => {
+                            app.begin_start();
                         }
-                    }
+                        MouseEventKind::ScrollUp if app.screen == crate::app::Screen::Chat => {
+                            app.scroll_lines(-3);
+                        }
+                        MouseEventKind::ScrollDown if app.screen == crate::app::Screen::Chat => {
+                            app.scroll_lines(3);
+                        }
+                        _ => {}
+                    },
                     Some(Ok(_)) => {}
                     Some(Err(err)) => break Err(err).context("reading terminal input"),
                     None => break Ok(()),

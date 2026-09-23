@@ -73,6 +73,7 @@ pub enum Bus {
         refresh: bool,
     },
     Service(String),
+    Tick,
     OmarchyChanged,
 }
 
@@ -236,8 +237,14 @@ pub struct App {
     pub status: String,
     pub status_is_error: bool,
     pub connected: Option<bool>,
+    pub starting: bool,
+    pub pulse: u8,
+    pub start_hit: Option<(u16, u16, u16, u16)>,
     pub service: String,
     service_action: Option<&'static str>,
+    autostart_pending: bool,
+    start_tries: u8,
+    poll_started: bool,
     quit_requested: bool,
     pub chats: Vec<Conversation>,
     pub chat_index: usize,
@@ -320,8 +327,14 @@ impl App {
             status: String::new(),
             status_is_error: false,
             connected: None,
+            starting: false,
+            pulse: 0,
+            start_hit: None,
             service: "…".into(),
             service_action: None,
+            autostart_pending: false,
+            start_tries: 0,
+            poll_started: false,
             quit_requested: false,
             chats,
             chat_index: 0,
@@ -383,7 +396,11 @@ impl App {
     }
 
     pub fn bootstrap(&mut self) {
+        if self.config.autostart_ollama {
+            self.autostart_pending = true;
+        }
         self.probe();
+        self.start_poll();
         self.start_search();
         if self.watcher_started {
             return;
@@ -399,18 +416,11 @@ impl App {
 
     pub fn on_bus(&mut self, event: Bus) {
         match event {
-            Bus::Probe(ok) => {
-                self.connected = Some(ok);
-                if ok {
-                    if self.status.starts_with("Ollama is not running") {
-                        self.status.clear();
-                        self.status_is_error = false;
-                    }
-                } else {
-                    self.err(format!(
-                        "Ollama is not running at {}. Start it in Settings.",
-                        self.config.host
-                    ));
+            Bus::Probe(ok) => self.on_probe(ok),
+            Bus::Tick => {
+                self.pulse = self.pulse.wrapping_add(1);
+                if self.pulse % 5 == 0 {
+                    self.probe_connection();
                 }
             }
             Bus::Service(state) => self.service = state,
@@ -752,10 +762,114 @@ impl App {
 
     pub fn finish_service(&mut self, result: Result<String, String>) {
         match result {
+            Ok(_) if self.starting => self.info("Waiting for Ollama…"),
             Ok(message) => self.info(message),
-            Err(message) => self.err(message),
+            Err(message) => {
+                self.starting = false;
+                self.err(message);
+            }
         }
-        self.probe();
+        self.probe_connection();
+    }
+
+    pub fn can_start(&self) -> bool {
+        self.connected == Some(false) && !self.starting && self.service_action.is_none()
+    }
+
+    pub fn begin_start(&mut self) {
+        if !self.can_start() && !(self.autostart_pending && !self.starting) {
+            return;
+        }
+        self.autostart_pending = false;
+        self.starting = true;
+        self.start_tries = 0;
+        self.service_action = Some("start");
+        self.info("Starting Ollama…");
+    }
+
+    pub fn start_clicked(&self, column: u16, row: u16) -> bool {
+        self.start_hit.is_some_and(|(x, y, width, height)| {
+            column >= x
+                && row >= y
+                && column < x.saturating_add(width)
+                && row < y.saturating_add(height)
+        })
+    }
+
+    fn on_probe(&mut self, ok: bool) {
+        let previous = self.connected;
+        self.connected = Some(ok);
+        if ok {
+            self.starting = false;
+            self.autostart_pending = false;
+            self.start_tries = 0;
+            if self.status.starts_with("Ollama is not running")
+                || self.status.starts_with("Starting Ollama")
+                || self.status.starts_with("Waiting for Ollama")
+            {
+                self.status.clear();
+                self.status_is_error = false;
+            }
+            if previous != Some(true) {
+                self.refresh_tags();
+                self.refresh_running();
+            }
+            return;
+        }
+        if self.autostart_pending && !self.starting {
+            self.begin_start();
+            return;
+        }
+        if self.starting {
+            self.start_tries = self.start_tries.saturating_add(1);
+            if self.start_tries > 20 {
+                self.starting = false;
+                self.err("Ollama did not come online.");
+            }
+            return;
+        }
+        if previous != Some(false) {
+            self.err(format!(
+                "Ollama is not running at {}. Press s or Start.",
+                self.config.host
+            ));
+        }
+    }
+
+    fn start_poll(&mut self) {
+        if self.poll_started {
+            return;
+        }
+        self.poll_started = true;
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(400));
+            loop {
+                interval.tick().await;
+                if tx.send(Bus::Tick).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn probe_connection(&mut self) {
+        let host = self.config.host.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let ok = ollama::tags(&host).await.is_ok();
+            let _ = tx.send(Bus::Probe(ok));
+        });
+    }
+
+    fn refresh_tags(&mut self) {
+        let host = self.config.host.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            if let Ok(models) = ollama::tags(&host).await {
+                let _ = tx.send(Bus::Tags(models));
+            }
+        });
     }
 
     fn typing(&self) -> bool {
@@ -813,6 +927,14 @@ impl App {
         }
         if ctrl(&key, 'b') {
             self.toggle_chats();
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('s'))
+            && key.modifiers.is_empty()
+            && self.chat_pane != ChatPane::Composer
+            && self.can_start()
+        {
+            self.begin_start();
             return;
         }
         match key.code {

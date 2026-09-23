@@ -23,7 +23,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let theme = app.theme.clone();
     frame.render_widget(Block::default().style(theme.base()), area);
 
-    let footer_h = if app.pull.is_some() { 2 } else { 1 };
+    app.start_hit = None;
+    let footer_h = if app.pull.is_some() || app.starting {
+        2
+    } else {
+        1
+    };
     let [status, tabs, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -127,7 +132,7 @@ fn draw_tabs(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.base()), area);
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+fn draw_footer(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let hint = match app.screen {
         Screen::Chat => "wheel or pgup scrolls  up/down at the prompt  /help",
         Screen::Models => "j/k move  enter use  d delete  u unload  p pull",
@@ -136,7 +141,17 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
         Screen::Settings => "j/k move  enter edit  ← → nudge  esc cancel",
     };
-    if let Some(pull) = app.pull.as_ref() {
+    if app.starting {
+        let [gauge_area, hint_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+        let ratio = (app.pulse % 8) as f64 / 7.0;
+        let gauge = Gauge::default()
+            .ratio(ratio.clamp(0.05, 1.0))
+            .label("Starting Ollama…")
+            .gauge_style(Style::default().fg(theme.accent).bg(theme.bg_raised));
+        frame.render_widget(gauge, gauge_area);
+        draw_hint(frame, app, theme, hint_area, hint);
+    } else if let Some(pull) = app.pull.as_ref() {
         let [gauge_area, hint_area] =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
         let ratio = if pull.total == 0 {
@@ -166,22 +181,35 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     }
 }
 
-fn draw_hint(frame: &mut Frame, app: &App, theme: &Theme, area: Rect, hint: &str) {
+fn draw_hint(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect, hint: &str) {
     let (label, color) = connection(app, theme);
     let label = format!(" {label} ");
     let label_w = UnicodeWidthStr::width(label.as_str()) + 1;
-    let hint_w = (area.width as usize).saturating_sub(label_w);
+    let mut prefix = Vec::new();
+    let mut prefix_w = 0usize;
+    if app.can_start() {
+        let button = " Start ";
+        app.start_hit = Some((area.x, area.y, button.len() as u16, 1));
+        prefix.push(Span::styled(
+            button,
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        ));
+        prefix_w = button.len();
+    }
+    let hint_w = (area.width as usize).saturating_sub(label_w + prefix_w);
     let hint = format!(" {}", truncate(hint, hint_w.saturating_sub(1)));
     let hint_w_drawn = UnicodeWidthStr::width(hint.as_str());
-    let pad = (area.width as usize).saturating_sub(hint_w_drawn + label_w);
+    let pad = (area.width as usize).saturating_sub(hint_w_drawn + label_w + prefix_w);
     let bg = theme.bg_deep;
-    let line = Line::from(vec![
-        Span::styled(hint, Style::default().fg(theme.muted).bg(bg)),
-        Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-        Span::styled("●", Style::default().fg(color).bg(bg)),
-        Span::styled(label, Style::default().fg(theme.fg_dim).bg(bg)),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    let mut spans = prefix;
+    spans.push(Span::styled(hint, Style::default().fg(theme.muted).bg(bg)));
+    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
+    spans.push(Span::styled("●", Style::default().fg(color).bg(bg)));
+    spans.push(Span::styled(
+        label,
+        Style::default().fg(theme.fg_dim).bg(bg),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
@@ -199,12 +227,13 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         "  /model then a space filters installed models",
         "  ^B or /chats shows or hides the chat list",
         "  type / to filter commands, tab completes, enter runs",
+        "  s or the Start button starts Ollama when it is offline",
         "  /help  /quit  /q",
         "",
         "Settings can start Ollama with the app, and stop it on quit.",
         "tab / shift+tab switch screens    ? help    q or ^C quit",
     ];
-    overlay(frame, theme, area, " Help ", &lines, 68, 22);
+    overlay(frame, theme, area, " Help ", &lines, 68, 24);
 }
 
 fn draw_confirm(frame: &mut Frame, theme: &Theme, area: Rect, confirm: &crate::app::Confirm) {
@@ -432,5 +461,6 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let offline = buffer_text(&terminal);
         assert!(offline.contains("Ollama is not running"), "{offline}");
+        assert!(offline.contains("Start"), "{offline}");
     }
 }

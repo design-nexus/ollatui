@@ -115,7 +115,10 @@ fn transcript_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>
     let mut lines = Vec::new();
     if app.connected == Some(false) {
         lines.push(Line::from(Span::styled(
-            format!("Ollama is not running at {}. Type /start.", app.config.host),
+            format!(
+                "Ollama is not running at {}. Press s or Start.",
+                app.config.host
+            ),
             Style::default().fg(theme.red),
         )));
         lines.push(Line::from(""));
